@@ -1,0 +1,139 @@
+import cv2
+import numpy as np
+import serial
+
+# Load the pre-trained model
+net = cv2.dnn.readNetFromCaffe('deploy.prototxt.txt', 'res10_300x300_ssd_iter_140000.caffemodel')
+
+# To capture video from webcam.
+cap = cv2.VideoCapture(1)
+
+# Initialize the state (x, y, w, h) and the uncertainty of the state
+state = np.array([0, 0, 0, 0], dtype=np.float32)
+uncertainty = np.array([100, 100, 100, 100], dtype=np.float32)
+
+# Motion model (constant velocity model)
+F = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+
+# Measurement model (face detection model)
+H = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+
+# Covariance of the process noise
+Q = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+
+# Covariance of the measurement noise
+R = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+
+# Open the serial connection to the Arduino
+ser = serial.Serial('COM9', 9600, timeout=1)
+
+# Initialize the pan and tilt servo positions
+pan_servo_position = 90
+tilt_servo_position = 90
+
+# PID constants
+Kp = 0.1
+Ki = 0
+Kd = 0.1
+
+# Previous error
+previous_error_x = 0
+previous_error_y = 0
+
+# Integral
+integral_x = 0
+integral_y = 0
+
+while True:
+    # Read the frame
+    _, img = cap.read()
+
+    # Get the height and width of the frame
+    (h, w) = img.shape[:2]
+
+    # Create a blob from the frame
+    blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+
+    # Pass the blob through the network and obtain the detections
+    net.setInput(blob)
+    detections = net.forward()
+
+    # Predict the state
+    state_pred = np.dot(F, state)
+    uncertainty_pred = np.dot(F, np.dot(uncertainty, F.T)) + Q
+
+    # Predict the measurement
+    measurement_pred = np.dot(H, state_pred)
+
+    # Get the actual measurement (face detection)
+    for i in range(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (startX, startY, endX, endY) = box.astype("int")
+            measurement = np.array([startX, startY, endX, endY], dtype=np.float32)
+
+            # Update the state and the uncertainty of the state
+            innovation = measurement - measurement_pred
+            innovation_cov = np.dot(H, np.dot(uncertainty_pred, H.T)) + R
+            gain = np.dot(uncertainty_pred, np.dot(H.T, np.linalg.inv(innovation_cov)))
+            state = state_pred + np.dot(gain, innovation)
+            uncertainty = uncertainty_pred - np.dot(gain, np.dot(innovation_cov, gain.T))
+
+            # Calculate the error between the center of the face and the center of the frame
+            face_center_x = (startX + endX) / 2
+            face_center_y = (startY + endY) / 2
+            error_x = face_center_x - w / 2
+            error_y = face_center_y - h / 2
+
+            # PID control
+            integral_x += error_x
+            integral_y += error_y
+            derivative_x = error_x - previous_error_x
+            derivative_y = error_y - previous_error_y
+            control_x = Kp * error_x + Ki * integral_x + Kd * derivative_x
+            control_y = Kp * error_y + Ki * integral_y + Kd * derivative_y
+
+            # Send commands to the Arduino to move the servos
+            if control_x > 10:
+                if pan_servo_position < 180:  # Check if the pan servo is not at its maximum position
+                    ser.write(b'p+')  # Move the pan servo to the right
+                    print('pan right')
+                    pan_servo_position += 10
+            elif control_x < -10:
+                if pan_servo_position > 0:  # Check if the pan servo is not at its minimum position
+                    ser.write(b'p-')  # Move the pan servo to the left
+                    print('pan left')
+                    pan_servo_position -= 10
+            if control_y > 10:
+                if tilt_servo_position < 100:  # Check if the tilt servo is not at its maximum position
+                    ser.write(b't+')  # Move the tilt servo up
+                    print('tilt up')
+                    tilt_servo_position += 10
+            elif control_y < -10:
+                if tilt_servo_position > 30:  # Check if the tilt servo is not at its minimum position
+                    ser.write(b't-')  # Move the tilt servo down
+                    print('tilt down')
+                    tilt_servo_position -= 10
+
+            # Update the previous error
+            previous_error_x = error_x
+            previous_error_y = error_y
+
+            # Draw the rectangle around the face
+            cv2.rectangle(img, (startX, startY), (endX, endY), (0, 0, 255), 2)
+
+
+    # Display
+    cv2.imshow('img', img)
+
+    # Stop if escape key is pressed
+    k = cv2.waitKey(30) & 0xff
+    if k == 27:
+        break
+
+# Release the VideoCapture object
+cap.release()
+
+# Close the serial connection
+ser.close()
